@@ -7,6 +7,7 @@ This document specifies the exact mathematical formulations implemented in `src/
 ## 1. Intraday Market Microstructure Indicators (`src/finpulse/analytics.py`)
 
 ### 1.1 Session VWAP & Volume-Weighted $\pm 1\sigma$ Bands
+
 For intraday bar $i \in \{1, \dots, t\}$ with high $H_i$, low $L_i$, close $C_i$, and volume $V_i$:
 $$\text{TP}_i = \frac{H_i + L_i + C_i}{3}, \qquad \text{VWAP}_t = \frac{\sum_{i=1}^t \text{TP}_i \cdot V_i}{\sum_{i=1}^t V_i}$$
 The volume-weighted variance around session VWAP is computed via the second moment:
@@ -14,14 +15,17 @@ $$\sigma_{\text{VWAP}, t}^2 = \max\!\left(0,\; \frac{\sum_{i=1}^t \text{TP}_i^2 
 giving upper and lower $1\sigma$ bands $\text{VWAP}_t \pm \sigma_{\text{VWAP}, t}$.
 
 ### 1.2 True Range ($\text{TR}$) and $\text{ATR}(14)$
+
 $$\text{TR}_t = \max\!\big(H_t - L_t,\; |H_t - C_{t-1}|,\; |L_t - C_{t-1}|\big)$$
 $$\text{ATR}_{14, t} = \frac{1}{w} \sum_{k=t-w+1}^t \text{TR}_k, \qquad w = \min(14, t)$$
 
 ### 1.3 Wilder / EWMA Relative Strength Index ($\text{RSI}(14)$)
+
 With bar-to-bar close change $\Delta C_t = C_t - C_{t-1}$, upward move $U_t = \max(\Delta C_t, 0)$, and downward move $D_t = \max(-\Delta C_t, 0)$ smoothed with $\alpha = 1/14$:
 $$\text{RS}_t = \frac{\text{EWMA}_\alpha(U)_t}{\text{EWMA}_\alpha(D)_t}, \qquad \text{RSI}_{14, t} = 100 - \frac{100}{1 + \text{RS}_t}$$
 
 ### 1.4 Empirical Bayes Barrier-Crossing Touch Probability
+
 Given target distance $+k \cdot \text{ATR}$ and stop distance $-m \cdot \text{ATR}$, the random-walk barrier-crossing prior is:
 $$P_0 = \frac{m}{k + m}$$
 Across $N$ historical rolling forward horizons in the session, if $W$ trials reach $C_i + k \cdot \text{ATR}_i$ before breaching $C_i - m \cdot \text{ATR}_i$, the empirical rate $\hat{p} = W / N$ is shrunk toward $P_0$ via Empirical Bayes weighting:
@@ -32,10 +36,12 @@ $$P_{\text{touch}} = w \cdot \hat{p} + (1 - w) \cdot P_0, \qquad w = \min\!\left
 ## 2. Black-Scholes-Merton Option Pricing, Greeks & IV Solver (`src/finpulse/analytics.py`)
 
 For spot price $S$, strike $K$, annualized risk-free rate $r$, annualized implied volatility $\sigma$, and time to expiry $T = \text{DTE} / 365$:
-$$d_1 = \frac{\ln(S / K) + \left(r + \frac{1}{2}\sigma^2\right)T}{\sigma\sqrt{T}}, \qquad d_2 = d_1 - \sigma\sqrt{T}$$
+$$d_1 = \frac{\ln(S / K) + \left(r + \frac{1}{2}\sigma^2\right)T}{\sigma\sqrt{T}}, \qquad d_2 = d1 - \sigma\sqrt{T}$$
 
 ### 2.1 Option Prices & First/Second-Order Greeks
+
 With standard normal CDF $\Phi(x)$ and PDF $\phi(x)$:
+
 - **Call / Put Theoretical Price:**
   $$C = S\Phi(d_1) - Ke^{-rT}\Phi(d_2), \qquad P = Ke^{-rT}\Phi(-d_2) - S\Phi(-d_1)$$
 - **Delta ($\Delta$):**
@@ -51,11 +57,13 @@ With standard normal CDF $\Phi(x)$ and PDF $\phi(x)$:
   $$\varepsilon_{\text{parity}} = \left|(C - P) - \left(S - Ke^{-rT}\right)\right| < 10^{-6}$$
 
 ### 2.2 Hybrid Newton-Raphson + Bisection Implied Volatility Solver (`solve_implied_volatility`)
+
 Given observed market premium $V_{\text{mkt}}$, we solve $f(\sigma) = V_{\text{BS}}(\sigma) - V_{\text{mkt}} = 0$ over bracket $[\sigma_{\text{low}}, \sigma_{\text{high}}] = [0.01, 4.00]$:
 $$\sigma_{n+1} = \sigma_n - \frac{V_{\text{BS}}(\sigma_n) - V_{\text{mkt}}}{\partial V_{\text{BS}} / \partial \sigma}$$
 Whenever the Newton step jumps outside the tightened bracket $[\sigma_{\text{low}}, \sigma_{\text{high}}]$ or Vega approaches zero in deep OTM/ITM tails, the solver falls back to the midpoint $\frac{1}{2}(\sigma_{\text{low}} + \sigma_{\text{high}})$, guaranteeing convergence within 40 iterations to $|f(\sigma)| < 10^{-4}$.
 
 ### 2.3 Pre-Trade Risk Governance, Net-R, Half-Kelly & VaR / CVaR (`compute_position_sizing_and_risk`)
+
 - **Volatility-Normalized Lot Sizing:** Given account equity $E$, per-trade risk fraction $r_{\max}$ ($1.0R = E \cdot r_{\max}$), round-trip transaction charges $F$, and stop distance $\Delta_{\text{stop}} = |P_{\text{entry}} - P_{\text{stop}}|$:
   $$Q = \left\lfloor \frac{\max(1.0R - F, 0)}{\Delta_{\text{stop}} \cdot L} \right\rfloor \cdot L$$
 - **Net-R vs. Gross-R & Half-Kelly Fraction:**
@@ -67,13 +75,29 @@ Whenever the Newton step jumps outside the tightened bracket $[\sigma_{\text{low
 
 ## 3. Hybrid Vector + Lexical Retrieval & IR Metrics (`src/finpulse/rag.py`)
 
-### 3.1 Okapi BM25 Lexical Score
+### 3.1 Dense Embeddings (`BAAI/bge-small-en-v1.5`) & Signed Feature-Hashing Fallback
+
+In primary mode, text $x$ is encoded by the 384-dimensional transformer encoder $f_\theta(x)$ (`SentenceTransformer("BAAI/bge-small-en-v1.5")`) and normalized onto the unit hypersphere $\mathbb{S}^{383}$:
+$$\hat{\mathbf{v}}(x) = \frac{f_\theta(x)}{\|f_\theta(x)\|_2}, \qquad \cos(\mathbf{q}, \mathbf{d}) = \hat{\mathbf{q}}^\top \hat{\mathbf{d}}$$
+
+When running in offline/air-gapped fallback mode (`encode_texts_hash`), each unigram, bigram, and character trigram feature $f$ with raw count $c_f$ receives sublinear TF weight $w_f = 1 + \ln(c_f)$ and is projected into $\mathbb{R}^{384}$ via two signed `blake2b` probes $(h_1, s_1)$ and $(h_2, s_2)$ before $L_2$ normalization:
+$$v_j = \sum_{f:\, h_1(f) \equiv j} s_1(f)\,w_f \;+\; \frac{1}{2}\sum_{f:\, h_2(f) \equiv j} s_2(f)\,w_f, \qquad \hat{\mathbf{v}} = \frac{\mathbf{v}}{\|\mathbf{v}\|_2}$$
+
+### 3.2 Okapi BM25 Lexical Score
+
 For query $Q$ and chunk $d$ with token length $|d|$ and corpus average chunk length $\text{avgdl}$ ($k_1 = 1.5, b = 0.75$):
 $$\text{BM25}(Q, d) = \sum_{q \in Q} \ln\!\left(1 + \frac{N - \text{df}(q) + 0.5}{\text{df}(q) + 0.5}\right) \cdot \frac{\text{tf}(q, d)\cdot(k_1 + 1)}{\text{tf}(q, d) + k_1\cdot\left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}$$
 
-### 3.2 Reciprocal Rank Fusion (RRF)
+### 3.3 Reciprocal Rank Fusion (RRF)
+
 Combining rank $r_{\text{dense}}(d)$ from `faiss.IndexFlatIP` cosine similarity and rank $r_{\text{bm25}}(d)$ from Okapi BM25:
 $$\text{RRF}(d) = \frac{1}{60 + r_{\text{dense}}(d)} + \frac{1}{60 + r_{\text{bm25}}(d)}$$
 
-### 3.3 Information Retrieval Evaluation Metrics ($\text{Recall}@K$, $\text{MRR}@K$, $\text{NDCG}@K$)
-$$\text{MRR}@K = \frac{1}{|Q|}\sum_{q=1}^{|Q|} \frac{1}{\text{rank}_q}, \qquad \text{NDCG}@K = \frac{\text{DCG}@K}{\text{IDCG}@K}, \qquad \text{DCG}@K = \sum_{i=1}^K \frac{\text{rel}_i}{\log_2(i + 1)}$$
+### 3.4 Information Retrieval Evaluation Metrics ($\text{Recall}@K$, $\text{MRR}@K$, Graded $\text{NDCG}@K$)
+
+For each benchmark query $q \in Q$ with target section chunks $C_q^*$ and target document $D_q^*$, retrieved chunk $d_i$ at rank $i \in \{1, \dots, K\}$ is assigned graded relevance:
+$$\text{rel}_i = \begin{cases} 1.0 & \text{if } d_i \in C_q^* \\ 0.25 & \text{if } d_i \notin C_q^* \text{ and } \text{doc}(d_i) \in D_q^* \\ 0.0 & \text{otherwise} \end{cases}$$
+
+From these graded relevance scores, `evaluate_retrieval_benchmark` computes:
+$$\text{Recall}@K(q) = \mathbb{I}\!\left(\exists\, i \le K : d_i \in C_q^*\right), \qquad \text{MRR}@K = \frac{1}{|Q|}\sum_{q=1}^{|Q|} \frac{1}{\text{rank}_q}$$
+$$\text{DCG}@K = \sum_{i=1}^K \frac{\text{rel}_i}{\log_2(i + 1)}, \qquad \text{NDCG}@K = \frac{\text{DCG}@K}{\text{IDCG}@K}$$
