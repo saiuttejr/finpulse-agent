@@ -77,3 +77,19 @@ def require_jwt_claims(
             detail="Missing Bearer authentication token",
         )
     return verify_access_token(credentials.credentials)
+
+
+def require_scopes(*required_scopes: str):
+    """FastAPI dependency factory enforcing OAuth2 scope-based authorization (RBAC)."""
+
+    def _dependency(claims: dict[str, Any] = Depends(require_jwt_claims)) -> dict[str, Any]:
+        granted = set(str(claims.get("scope", "")).split())
+        missing = [s for s in required_scopes if s not in granted]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Insufficient OAuth2 scope; missing: {', '.join(missing)}",
+            )
+        return claims
+
+    return _dependency

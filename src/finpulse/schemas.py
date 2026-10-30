@@ -44,6 +44,10 @@ class RAGQueryRequest(BaseModel):
     category: str | None = Field(default=None)
     ticker: str | None = Field(default=None)
     use_hybrid_rrf: bool = Field(default=True)
+    retrieval_mode: Literal["hybrid_rrf", "dense_only", "lexical_only"] = Field(
+        default="hybrid_rrf",
+        description="Retrieval scoring strategy for ablation or production search",
+    )
 
 
 class RetrievedChunk(BaseModel):
@@ -62,6 +66,39 @@ class RAGQueryResponse(BaseModel):
     sanitized_query: str
     total_candidates: int
     results: list[RetrievedChunk]
+
+
+class EvalCaseResult(BaseModel):
+    query: str
+    expected_doc_ids: list[str]
+    retrieved_doc_ids: list[str]
+    recall_at_k: float
+    reciprocal_rank: float
+    ndcg_at_k: float
+    latency_ms: float
+
+
+class ModeEvalSummary(BaseModel):
+    retrieval_mode: Literal["hybrid_rrf", "dense_only", "lexical_only"]
+    top_k: int
+    num_queries: int
+    mean_recall_at_k: float
+    mrr_at_k: float
+    mean_ndcg_at_k: float
+    mean_latency_ms: float
+    p95_latency_ms: float
+    cases: list[EvalCaseResult]
+
+
+class RAGEvalRequest(BaseModel):
+    top_k: int = Field(default=3, ge=1, le=10)
+    include_per_query_cases: bool = Field(default=True)
+
+
+class RAGEvalResponse(BaseModel):
+    top_k: int
+    corpus_chunks: int
+    modes: dict[str, ModeEvalSummary]
 
 
 class OHLCVBar(BaseModel):
@@ -125,7 +162,40 @@ class OptionGreeksResponse(BaseModel):
     gamma: float
     theta_per_day: float
     vega_per_pct: float
+    vanna: float = 0.0
+    charm_per_day: float = 0.0
+    put_call_parity_residual: float = 0.0
     moneyness: Literal["ITM", "ATM", "OTM"]
+
+
+class PositionSizingRequest(BaseModel):
+    account_equity: float = Field(default=1000000.0, gt=0, description="Total trading capital")
+    max_risk_pct: float = Field(default=0.01, gt=0, le=0.10, description="Max risk per trade (1.0 R = 1%)")
+    entry_price: float = Field(..., gt=0)
+    stop_price: float = Field(..., gt=0)
+    target_price: float = Field(..., gt=0)
+    lot_size: int = Field(default=1, ge=1)
+    round_trip_charges: float = Field(default=65.0, ge=0.0, description="Brokerage + statutory fees")
+    current_daily_r: float = Field(default=0.0, le=10.0, description="Session realized/unrealized R")
+    win_probability: float = Field(default=0.52, gt=0.0, lt=1.0)
+    returns_sample: list[float] | None = Field(default=None, description="Optional bar returns for VaR/CVaR")
+
+
+class PositionSizingResponse(BaseModel):
+    account_equity: float
+    one_r_capital: float
+    stop_distance: float
+    recommended_units: int
+    recommended_lots: int
+    capital_deployed: float
+    max_loss_at_stop: float
+    gross_reward_to_risk: float
+    net_reward_to_risk: float
+    half_kelly_fraction: float
+    var_95_pct: float
+    cvar_95_pct: float
+    governance_approved: bool
+    rejection_reasons: list[str]
 
 
 class AgentAnalyzeRequest(BaseModel):
@@ -134,6 +204,7 @@ class AgentAnalyzeRequest(BaseModel):
     top_k: int = Field(default=3, ge=1, le=10)
     bars: list[OHLCVBar] | None = None
     option_params: OptionGreeksRequest | None = None
+    risk_params: PositionSizingRequest | None = None
 
 
 class NodeExecutionStep(BaseModel):
@@ -151,6 +222,8 @@ class AgentAnalyzeResponse(BaseModel):
     citations: list[RetrievedChunk]
     quant_summary: QuantIndicatorSummary | None = None
     option_greeks: OptionGreeksResponse | None = None
+    risk_summary: PositionSizingResponse | None = None
     hallucination_check_passed: bool
+    numerical_faithfulness_passed: bool = True
     confidence_score: float
     execution_trace: list[NodeExecutionStep]

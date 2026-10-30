@@ -12,6 +12,8 @@ from finpulse.schemas import (
     OHLCVBar,
     OptionGreeksRequest,
     OptionGreeksResponse,
+    PositionSizingRequest,
+    PositionSizingResponse,
     QuantIndicatorSummary,
 )
 
@@ -292,6 +294,35 @@ def compute_option_greeks(req: OptionGreeksRequest) -> OptionGreeksResponse:
         option_type=req.option_type,
     )
 
+    # Second-order Greeks (Vanna & daily Charm) + Put-Call Parity residual check
+    t = max(req.dte_days / 365.0, 1.0 / (365.0 * 24.0))
+    sigma = max(iv, 1e-4)
+    sqrt_t = math.sqrt(t)
+    d1 = (math.log(req.spot / req.strike) + (req.risk_free_rate + 0.5 * sigma * sigma) * t) / (
+        sigma * sqrt_t
+    )
+    d2 = d1 - sigma * sqrt_t
+    pdf_d1 = _norm_pdf(d1)
+    vanna = (-pdf_d1 * d2 / sigma) / 100.0
+    charm_annual = -pdf_d1 * (
+        (2.0 * req.risk_free_rate * t - d2 * sigma * sqrt_t) / (2.0 * t * sigma * sqrt_t)
+    )
+    charm_day = charm_annual / 365.0
+
+    other_type: Literal["CE", "PE"] = "PE" if req.option_type == "CE" else "CE"
+    other_price, _, _, _, _ = black_scholes_price_and_greeks(
+        spot=req.spot,
+        strike=req.strike,
+        dte_days=req.dte_days,
+        volatility=iv,
+        risk_free_rate=req.risk_free_rate,
+        option_type=other_type,
+    )
+    call_p = price if req.option_type == "CE" else other_price
+    put_p = other_price if req.option_type == "CE" else price
+    parity_rhs = req.spot - req.strike * math.exp(-req.risk_free_rate * t)
+    parity_residual = abs((call_p - put_p) - parity_rhs)
+
     rel_diff = abs(req.spot - req.strike) / req.spot
     if rel_diff <= 0.0075:
         moneyness: Literal["ITM", "ATM", "OTM"] = "ATM"
@@ -313,5 +344,84 @@ def compute_option_greeks(req: OptionGreeksRequest) -> OptionGreeksResponse:
         gamma=round(gamma, 6),
         theta_per_day=round(theta_day, 4),
         vega_per_pct=round(vega_pct, 4),
+        vanna=round(vanna, 6),
+        charm_per_day=round(charm_day, 6),
+        put_call_parity_residual=round(parity_residual, 8),
         moneyness=moneyness,
+    )
+
+
+def compute_position_sizing_and_risk(req: PositionSizingRequest) -> PositionSizingResponse:
+    """Compute ATR/volatility-normalized position sizing, Net-R after transaction
+    charges, Half-Kelly optimal fraction, 95% VaR/CVaR, and pre-trade governance checks."""
+    one_r_capital = req.account_equity * req.max_risk_pct
+    stop_distance = max(abs(req.entry_price - req.stop_price), 1e-4)
+    reward_distance = abs(req.target_price - req.entry_price)
+
+    net_risk_budget = max(one_r_capital - req.round_trip_charges, 0.0)
+    raw_units = int(math.floor(net_risk_budget / stop_distance))
+    recommended_lots = max(raw_units // req.lot_size, 0)
+    recommended_units = recommended_lots * req.lot_size
+
+    gross_rr = reward_distance / stop_distance
+    if recommended_units > 0:
+        gross_profit = recommended_units * reward_distance
+        gross_loss = recommended_units * stop_distance
+        net_profit = max(gross_profit - req.round_trip_charges, 0.0)
+        net_loss = gross_loss + req.round_trip_charges
+        net_rr = net_profit / max(net_loss, 1e-4)
+        max_loss_at_stop = net_loss
+    else:
+        net_rr = 0.0
+        max_loss_at_stop = req.round_trip_charges
+
+    p = req.win_probability
+    q = 1.0 - p
+    full_kelly = p - (q / max(net_rr, 1e-4)) if net_rr > 0 else 0.0
+    half_kelly = max(min(0.5 * full_kelly, 0.25), 0.0)
+
+    # 95% Value-at-Risk (VaR) and Conditional VaR (Expected Shortfall)
+    if req.returns_sample and len(req.returns_sample) >= 5:
+        arr = np.asarray(req.returns_sample, dtype=np.float64)
+        var_95 = float(max(-np.percentile(arr, 5), 0.0))
+        tail = arr[arr <= -var_95]
+        cvar_95 = float(max(-np.mean(tail), var_95)) if len(tail) > 0 else var_95 * 1.25
+    else:
+        implied_bar_sigma = stop_distance / max(req.entry_price, 1.0)
+        var_95 = 1.64485 * implied_bar_sigma
+        cvar_95 = 2.06271 * implied_bar_sigma
+
+    rejection_reasons: list[str] = []
+    if req.current_daily_r <= -2.0:
+        rejection_reasons.append(
+            f"Daily drawdown wall breached ({req.current_daily_r:.2f}R <= -2.00R); new entries blocked."
+        )
+    if recommended_units <= 0:
+        rejection_reasons.append(
+            "Stop distance plus round-trip charges exceeds 1.0R per-trade risk budget for 1 lot."
+        )
+    if max_loss_at_stop > one_r_capital * 1.0001:
+        rejection_reasons.append(
+            f"Max loss at stop ({max_loss_at_stop:.2f}) exceeds 1.0R floor ({one_r_capital:.2f})."
+        )
+    if net_rr < 1.5:
+        rejection_reasons.append(
+            f"Net reward-to-risk ({net_rr:.2f}x) is below the 1.50x minimum expectancy threshold."
+        )
+
+    return PositionSizingResponse(
+        account_equity=round(req.account_equity, 2),
+        one_r_capital=round(one_r_capital, 2),
+        stop_distance=round(stop_distance, 4),
+        recommended_units=recommended_units,
+        recommended_lots=recommended_lots,
+        capital_deployed=round(recommended_units * req.entry_price, 2),
+        max_loss_at_stop=round(max_loss_at_stop, 2),
+        gross_reward_to_risk=round(gross_rr, 3),
+        net_reward_to_risk=round(net_rr, 3),
+        half_kelly_fraction=round(half_kelly, 4),
+        var_95_pct=round(var_95 * 100.0, 4),
+        cvar_95_pct=round(cvar_95 * 100.0, 4),
+        governance_approved=(len(rejection_reasons) == 0),
+        rejection_reasons=rejection_reasons,
     )

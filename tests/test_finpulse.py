@@ -10,17 +10,24 @@
 from __future__ import annotations
 
 import math
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from finpulse.agent import FinPulseLangGraphAgent, default_sample_bars
+from finpulse.agent import (
+    FinPulseLangGraphAgent,
+    default_sample_bars,
+    synthesize_with_llm,
+    verify_numerical_faithfulness,
+)
 from finpulse.analytics import (
     black_scholes_price_and_greeks,
     compute_intraday_indicators,
     compute_option_greeks,
+    compute_position_sizing_and_risk,
     solve_implied_volatility,
 )
-from finpulse.api import app
+from finpulse.api import TokenBucketRateLimiter, app
 from finpulse.auth import (
     DEFAULT_CLIENT_ID,
     DEFAULT_CLIENT_SECRET,
@@ -34,6 +41,9 @@ from finpulse.rag import (
     build_default_store,
     chunk_document,
     encode_texts_dense,
+    encode_texts_hash,
+    evaluate_retrieval_benchmark,
+    get_active_embedding_backend,
     sanitize_prompt_input,
 )
 from finpulse.schemas import (
@@ -41,6 +51,7 @@ from finpulse.schemas import (
     DocumentInput,
     OHLCVBar,
     OptionGreeksRequest,
+    PositionSizingRequest,
 )
 
 
@@ -264,3 +275,224 @@ def test_ohclv_schema_rejects_high_below_low() -> None:
             close=97.0,
             volume=1000.0,
         )
+
+
+def test_idempotent_document_deduplication_and_rag_eval_benchmark() -> None:
+    store = build_default_store()
+    initial_count = store.total_vectors
+
+    dup_doc = DocumentInput(
+        doc_id="dedup_test_doc",
+        title="Duplicate Check",
+        content="## Duplicate Section\nExact content for SHA-256 deduplication test in FAISS store.",
+        category="risk",
+    )
+    first_add = store.ingest_documents([dup_doc])
+    second_add = store.ingest_documents([dup_doc])
+    assert first_add == 1
+    assert second_add == 0
+    assert store.total_vectors == initial_count + 1
+
+    eval_res = evaluate_retrieval_benchmark(store, top_k=3, include_per_query_cases=True)
+    assert set(eval_res.modes.keys()) == {"hybrid_rrf", "dense_only", "lexical_only"}
+    hybrid = eval_res.modes["hybrid_rrf"]
+    assert hybrid.mean_recall_at_k >= 0.85
+    assert hybrid.mrr_at_k >= 0.80
+    assert hybrid.mean_ndcg_at_k >= 0.80
+
+
+def test_second_order_greeks_and_put_call_parity_residual() -> None:
+    res = compute_option_greeks(
+        OptionGreeksRequest(
+            spot=24350.0,
+            strike=24400.0,
+            dte_days=7.0,
+            option_type="CE",
+            volatility=0.18,
+            risk_free_rate=0.068,
+        )
+    )
+    assert res.put_call_parity_residual < 1e-6
+    assert res.vanna != 0.0
+    assert res.charm_per_day != 0.0
+
+
+def test_position_sizing_net_r_kelly_var_and_governance_guardrails() -> None:
+    approved = compute_position_sizing_and_risk(
+        PositionSizingRequest(
+            account_equity=1000000.0,
+            max_risk_pct=0.01,
+            entry_price=24350.0,
+            stop_price=24325.0,
+            target_price=24410.0,
+            lot_size=25,
+            round_trip_charges=65.0,
+            current_daily_r=-0.5,
+            win_probability=0.55,
+        )
+    )
+    assert approved.governance_approved is True
+    assert approved.recommended_units > 0
+    assert approved.recommended_units % 25 == 0
+    assert approved.max_loss_at_stop <= approved.one_r_capital
+    assert approved.net_reward_to_risk < approved.gross_reward_to_risk
+    assert approved.half_kelly_fraction > 0
+    assert approved.cvar_95_pct >= approved.var_95_pct > 0
+
+    rejected = compute_position_sizing_and_risk(
+        PositionSizingRequest(
+            account_equity=1000000.0,
+            max_risk_pct=0.01,
+            entry_price=24350.0,
+            stop_price=24325.0,
+            target_price=24365.0,
+            current_daily_r=-2.1,
+        )
+    )
+    assert rejected.governance_approved is False
+    assert len(rejected.rejection_reasons) >= 2
+
+
+def test_conditional_langgraph_bypass_and_corrective_query_rewrite() -> None:
+    store = build_default_store()
+    agent = FinPulseLangGraphAgent(store=store)
+
+    # Pure RAG knowledge query bypasses execute_quant_tools via conditional edge
+    pure_rag_res = agent.run(
+        AgentAnalyzeRequest(
+            query="Explain the OWASP LLM01 prompt injection delimiter policy",
+            symbol="NIFTY",
+            top_k=2,
+        )
+    )
+    assert pure_rag_res.routed_intent == "rag_knowledge"
+    assert pure_rag_res.quant_summary is None
+    assert pure_rag_res.option_greeks is None
+    assert [step.node for step in pure_rag_res.execution_trace] == [
+        "classify_and_route",
+        "retrieve_context",
+        "synthesize_and_grade",
+    ]
+
+    # High confidence threshold triggers Corrective RAG rewrite_query loop once
+    strict_agent = FinPulseLangGraphAgent(store=store, min_dense_confidence=0.95)
+    rewritten_res = strict_agent.run(
+        AgentAnalyzeRequest(
+            query="How do fees affect slippage?",
+            symbol="NIFTY",
+            top_k=2,
+        )
+    )
+    trace_nodes = [step.node for step in rewritten_res.execution_trace]
+    assert "rewrite_query" in trace_nodes
+    assert trace_nodes.count("retrieve_context") == 2
+
+
+def test_numerical_faithfulness_verifier_detects_tampering() -> None:
+    bars = default_sample_bars()
+    quant = compute_intraday_indicators("NIFTY", bars)
+    good_text = f"Close={quant.latest_close} vs VWAP={quant.vwap}, ATR(14)={quant.atr_14}"
+    bad_text = f"Close=99999.99 vs VWAP={quant.vwap}, ATR(14)={quant.atr_14}"
+    assert verify_numerical_faithfulness(good_text, quant, None) is True
+    assert verify_numerical_faithfulness(bad_text, quant, None) is False
+
+
+def test_rbac_scopes_rate_limiter_metrics_and_sse_streaming() -> None:
+    client = TestClient(app)
+
+    # 1. Read-only token is rejected with 403 Forbidden on write/agent endpoints
+    readonly_tok = create_access_token(subject="viewer", scope="rag:read")
+    r_forbidden = client.post(
+        "/v1/rag/ingest",
+        headers={"Authorization": f"Bearer {readonly_tok}"},
+        json={
+            "documents": [
+                {
+                    "doc_id": "unauth_doc",
+                    "title": "Blocked Doc",
+                    "content": "## Blocked\nShould fail RBAC scope check with 403.",
+                }
+            ]
+        },
+    )
+    assert r_forbidden.status_code == 403
+    assert "X-Request-ID" in r_forbidden.headers
+    assert "X-Process-Time-Ms" in r_forbidden.headers
+
+    # 2. Evaluate RAG endpoint and Risk endpoint
+    r_eval = client.post("/v1/rag/evaluate", json={"top_k": 3, "include_per_query_cases": False})
+    assert r_eval.status_code == 200
+    assert "hybrid_rrf" in r_eval.json()["modes"]
+
+    r_risk = client.post(
+        "/v1/quant/risk",
+        json={
+            "account_equity": 1000000.0,
+            "max_risk_pct": 0.01,
+            "entry_price": 24350.0,
+            "stop_price": 24320.0,
+            "target_price": 24420.0,
+        },
+    )
+    assert r_risk.status_code == 200
+    assert r_risk.json()["governance_approved"] is True
+
+    # 3. SSE streaming endpoint
+    full_tok = create_access_token(subject="trader", scope="agent:run")
+    r_stream = client.post(
+        "/v1/agent/stream",
+        headers={"Authorization": f"Bearer {full_tok}"},
+        json={"query": "Check NIFTY VWAP and 24400 CE Theta decay", "symbol": "NIFTY"},
+    )
+    assert r_stream.status_code == 200
+    assert "text/event-stream" in r_stream.headers["content-type"]
+    assert '"event": "node_completed"' in r_stream.text
+    assert '"event": "final_response"' in r_stream.text
+
+    # 4. Observability /metrics endpoint
+    r_metrics = client.get("/metrics")
+    assert r_metrics.status_code == 200
+    assert r_metrics.json()["total_requests"] >= 5
+
+    # 5. Token-bucket rate limiter unit check
+    limiter = TokenBucketRateLimiter(rate_per_sec=1.0, capacity=2.0)
+    assert limiter.allow("client-a") is True
+    assert limiter.allow("client-a") is True
+    assert limiter.allow("client-a") is False
+
+
+def test_huggingface_embeddings_and_llm_synthesis_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = get_active_embedding_backend()
+    assert backend.startswith("huggingface:") or backend == f"hash-{EMBEDDING_DIM}"
+
+    hash_vecs = encode_texts_hash(["VWAP standard deviation pullback"])
+    assert hash_vecs.shape == (1, EMBEDDING_DIM)
+    assert math.isclose(float((hash_vecs[0] ** 2).sum()), 1.0, rel_tol=1e-5)
+
+    bars = default_sample_bars()
+    quant = compute_intraday_indicators("NIFTY", bars)
+    expected_answer = (
+        f"NIFTY Close={quant.latest_close} vs VWAP={quant.vwap} with ATR(14)={quant.atr_14} "
+        "[intraday_microstructure#c2]."
+    )
+
+    def _mock_gemini_handler(request: httpx.Request) -> httpx.Response:
+        assert "generativelanguage.googleapis.com" in str(request.url)
+        return httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": expected_answer}]}}]},
+        )
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    mock_client = httpx.Client(transport=httpx.MockTransport(_mock_gemini_handler))
+    text, provider = synthesize_with_llm(
+        query="Analyze NIFTY VWAP",
+        citations=[],
+        quant=quant,
+        greeks=None,
+        http_client=mock_client,
+    )
+    mock_client.close()
+    assert provider.startswith("gemini:")
+    assert text == expected_answer
+    assert verify_numerical_faithfulness(text or "", quant, None) is True

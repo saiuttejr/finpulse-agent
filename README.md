@@ -1,13 +1,13 @@
 # FinPulse AI Agent (`finpulse-ai-agent`)
 
-Containerized **Python + FastAPI + LangChain + LangGraph + FAISS** microservice and **Streamlit** evaluation dashboard for financial document **Retrieval-Augmented Generation (RAG)** and **Pandas / NumPy** quantitative market-data & options Greek analysis.
+Containerized **Python + FastAPI + LangChain + LangGraph + Hugging Face (`sentence-transformers`) + FAISS** microservice and **Streamlit** evaluation dashboard for financial document **Retrieval-Augmented Generation (RAG)** and **Pandas / NumPy** quantitative market-data & options Greek analysis.
 
 ---
 
 ## Documentation Index
 
-- **[System Architecture & LangGraph Workflow](docs/ARCHITECTURE.md)** — 4-node `StateGraph` design, FAISS `IndexFlatIP` + BM25 Reciprocal Rank Fusion pipeline, and OWASP LLM01 / JWT security model.
-- **[REST API Reference](docs/API_REFERENCE.md)** — Request/response JSON schemas, authentication headers, and curl examples for all 7 FastAPI endpoints.
+- **[System Architecture & LangGraph Workflow](docs/ARCHITECTURE.md)** — Conditional `StateGraph` design, Hugging Face `BAAI/bge-small-en-v1.5` + FAISS `IndexFlatIP` + BM25 Reciprocal Rank Fusion pipeline, and OWASP LLM01 / JWT RBAC security model.
+- **[REST API Reference](docs/API_REFERENCE.md)** — Request/response JSON schemas, authentication headers, and curl examples for all 11 FastAPI endpoints.
 - **[Quantitative & Retrieval Math](docs/QUANT_AND_RAG_MATH.md)** — Exact equations for session VWAP ($\pm 1\sigma$), ATR(14), Wilder RSI(14), Empirical Bayes touch probability, Black-Scholes Greeks, Newton-Raphson IV solver, and BM25 + RRF.
 
 ---
@@ -16,33 +16,39 @@ Containerized **Python + FastAPI + LangChain + LangGraph + FAISS** microservice 
 
 ```mermaid
 flowchart LR
-    UI["Client / Streamlit UI"] -->|OAuth2 Bearer JWT| FastAPI["FastAPI Microservice"]
+    UI["Client / Streamlit UI"] -->|OAuth2 Scoped JWT| FastAPI["FastAPI + Rate Limiter"]
     FastAPI --> Route["1. classify_and_route\n(OWASP LLM01 Guard)"]
     Route --> Retrieve["2. retrieve_context\n(FAISS Cosine + BM25 RRF)"]
-    Retrieve --> Quant["3. execute_quant_tools\n(Pandas/NumPy + Black-Scholes)"]
-    Quant --> Grade["4. synthesize_and_grade\n(Citation & Hallucination Gate)"]
+    Retrieve -->|Low Confidence| Rewrite["2b. rewrite_query\n(Corrective RAG)"]
+    Rewrite --> Retrieve
+    Retrieve -->|Quant / Options Intent| Quant["3. execute_quant_tools\n(Indicators, Greeks, VaR/Risk)"]
+    Retrieve -->|Pure Knowledge Intent| Grade["4. synthesize_and_grade\n(Citation & Faithfulness Gate)"]
+    Quant --> Grade
 ```
 
 ---
 
 ## Architecture & Key Capabilities
 
-1. **Hybrid Vector + Lexical RAG (`src/finpulse/rag.py`):**
-   - Recursive markdown section chunking with document/category/ticker provenance metadata.
-   - 384-dimensional $L_2$-normalized dense vector embeddings indexed in **FAISS (`faiss.IndexFlatIP`)** for exact cosine similarity search.
-   - **Reciprocal Rank Fusion (RRF, $k=60$)** combining dense **FAISS** cosine retrieval with **BM25** lexical scoring and metadata filtering.
+1. **Thread-Safe Hybrid Vector + Lexical RAG & IR Evaluation (`src/finpulse/rag.py`):**
+   - Recursive markdown section chunking with document/category/ticker provenance metadata and SHA-256 content-hash deduplication.
+   - **Hugging Face `SentenceTransformer("BAAI/bge-small-en-v1.5")`** 384-dimensional $L_2$-normalized dense vector embeddings (with thread-safe vector caching and automatic offline/CI fallback) indexed in **FAISS (`faiss.IndexFlatIP`)** for exact cosine similarity search, protected by `threading.RLock`.
+   - **Reciprocal Rank Fusion (RRF, $k=60$)** combining dense **FAISS** cosine retrieval with **Okapi BM25** lexical scoring and metadata filtering.
+   - **Golden IR Evaluation Benchmark (`/v1/rag/evaluate`):** Automated ablation across `hybrid_rrf`, `dense_only`, and `lexical_only` computing **$\text{Recall}@K$**, **$\text{MRR}@K$**, **$\text{NDCG}@K$**, and **p95 latency**.
    - **OWASP LLM01 Prompt-Injection Defense:** Iterative stripping of `<system>`, `<instructions>`, and override directives prior to embedding and prompt synthesis.
-2. **Stateful 4-Node `LangGraph` Agent (`src/finpulse/agent.py`):**
-   - Built on `langgraph.graph.StateGraph` and `langchain_core.tools.tool`:
-     `classify_and_route -> retrieve_context -> execute_quant_tools -> synthesize_and_grade`
-   - Routes queries across RAG knowledge retrieval, **Pandas / NumPy** indicator computation, and **Black-Scholes** Greeks, returning structured Pydantic JSON with citations, hallucination verification, and per-node latency traces (`ms`).
-3. **Vectorized `Pandas` & `NumPy` Quantitative Engine (`src/finpulse/analytics.py`):**
-   - Intraday session **VWAP** (with $\pm 1\sigma$ volume-weighted bands), **ATR(14)**, **Wilder/EWMA RSI(14)**, **EMA(9/20)**, and **RVOL**.
-   - Empirical Bayes barrier-crossing **touch-probability** estimator ($+k \cdot \text{ATR}$ target before $-m \cdot \text{ATR}$ stop).
-   - **Black-Scholes-Merton** option pricing, analytical Greeks (**Delta, Gamma, daily Theta, Vega**), and a **Newton-Raphson Implied Volatility (IV) solver** with bisection bounds fallback.
-4. **OAuth2 / JWT Security & FastAPI Microservice (`src/finpulse/api.py`, `src/finpulse/auth.py`):**
-   - HS256 **JWT Bearer** authentication (`/v1/auth/token`, `PyJWT`) with constant-time `hmac.compare_digest` client verification and SHA-256 `appIdHash` OAuth2 auth-code signature generation.
-   - OpenAPI-documented REST endpoints (`/health`, `/v1/auth/token`, `/v1/rag/ingest`, `/v1/rag/query`, `/v1/quant/indicators`, `/v1/quant/greeks`, `/v1/agent/analyze`).
+2. **Conditional & Self-Correcting `LangGraph` Agent (`src/finpulse/agent.py`):**
+   - Built on `langgraph.graph.StateGraph` with `add_conditional_edges` and `langchain_core.tools.tool`:
+     - **Corrective RAG Loop:** Routes low-confidence retrievals through `rewrite_query` for domain synonym/acronym expansion before re-querying FAISS + BM25.
+     - **Conditional Tool Bypass:** Pure `rag_knowledge` queries bypass `execute_quant_tools` at the graph-edge level.
+     - **Grounded LLM Synthesis + Numerical Faithfulness Verifier:** Supports **Gemini (`GEMINI_API_KEY`)** and **OpenAI (`OPENAI_API_KEY`)** REST synthesis with automatic deterministic fallback and `verify_numerical_faithfulness` cross-checking every synthesized number against tool outputs (`QuantIndicatorSummary`, `OptionGreeksResponse`, `PositionSizingResponse`).
+     - **Server-Sent Events (SSE) Streaming (`/v1/agent/stream`):** Streams real-time per-node execution events.
+3. **Vectorized `Pandas` & `NumPy` Quant + Pre-Trade Risk Engine (`src/finpulse/analytics.py`):**
+   - Intraday session **VWAP** ($\pm 1\sigma$ volume-weighted bands), **ATR(14)**, **Wilder/EWMA RSI(14)**, **EMA(9/20)**, **RVOL**, and Empirical Bayes barrier-crossing **touch-probability** estimator.
+   - **Black-Scholes-Merton** option pricing, 1st & 2nd order analytical Greeks (**Delta, Gamma, daily Theta, Vega, Vanna, daily Charm**), **Put-Call Parity residual check**, and a **Newton-Raphson + Bisection Implied Volatility (IV) solver**.
+   - **Pre-Trade Risk Governance (`/v1/quant/risk`):** ATR volatility-normalized position sizing, **Gross-R vs. Net-R** after transaction charges, **Half-Kelly fraction**, **95% VaR & CVaR (Expected Shortfall)**, and hard $-2.0R$ daily drawdown wall enforcement.
+4. **OAuth2 RBAC Scopes, Rate Limiting & Observability (`src/finpulse/api.py`, `src/finpulse/auth.py`):**
+   - HS256 **JWT Bearer** authentication (`/v1/auth/token`, `PyJWT`) with fine-grained OAuth2 scope enforcement (`rag:write`, `agent:run`), constant-time `hmac.compare_digest` verification, and SHA-256 `appIdHash` signature generation.
+   - Thread-safe **Token-Bucket Rate Limiter** (`429 Too Many Requests`), `X-Request-ID` & `X-Process-Time-Ms` correlation middleware, and `/metrics` latency percentile telemetry (`p50`/`p95`).
 
 ---
 

@@ -12,35 +12,40 @@
 
 ```mermaid
 flowchart LR
-    Client["Client / Streamlit UI"] -->|Bearer JWT| API["FastAPI Router\n(src/finpulse/api.py)"]
-    API --> Auth["OAuth2 / HS256 JWT\n(src/finpulse/auth.py)"]
-    API --> Agent["4-Node LangGraph Agent\n(src/finpulse/agent.py)"]
+    Client["Client / Streamlit UI"] -->|Scoped Bearer JWT| API["FastAPI + Rate Limiter\n(src/finpulse/api.py)"]
+    API --> Auth["OAuth2 RBAC / HS256 JWT\n(src/finpulse/auth.py)"]
+    API --> Agent["Conditional LangGraph Agent\n(src/finpulse/agent.py)"]
 
-    subgraph LangGraph_StateGraph ["LangGraph StateGraph Workflow"]
+    subgraph LangGraph_StateGraph ["Conditional & Self-Correcting LangGraph Workflow"]
         N1["1. classify_and_route\n(OWASP LLM01 Sanitizer + Intent)"]
         N2["2. retrieve_context\n(FAISS + BM25 Hybrid RRF)"]
-        N3["3. execute_quant_tools\n(LangChain @tool Invocations)"]
-        N4["4. synthesize_and_grade\n(Citation & Hallucination Gate)"]
-        N1 --> N2 --> N3 --> N4
+        N2B["2b. rewrite_query\n(Corrective RAG Query Expansion)"]
+        N3["3. execute_quant_tools\n(Indicators, Greeks, VaR/Risk @tools)"]
+        N4["4. synthesize_and_grade\n(Citation + Numerical Faithfulness Gate)"]
+        N1 --> N2
+        N2 -->|Low Dense Confidence| N2B --> N2
+        N2 -->|Quant / Options Intent| N3 --> N4
+        N2 -->|Pure Knowledge Intent| N4
     end
 
     Agent --> N1
-    N2 --> RAG["HybridFAISSStore\n(src/finpulse/rag.py)"]
-    N3 --> Tools["Pandas / NumPy / Black-Scholes\n(src/finpulse/analytics.py)"]
+    N2 --> RAG["Thread-Safe HybridFAISSStore\n(src/finpulse/rag.py)"]
+    N3 --> Tools["Pandas / NumPy / Black-Scholes / VaR\n(src/finpulse/analytics.py)"]
 ```
 
 ---
 
-## 3. Stateful 4-Node `LangGraph` Workflow (`src/finpulse/agent.py`)
+## 3. Conditional `LangGraph` Workflow (`src/finpulse/agent.py`)
 
-The agent state (`FinPulseGraphState`) is a strictly typed `TypedDict` carrying the request, sanitized query, routed intent, retrieved citations, quantitative outputs, synthesized report, hallucination gate status, confidence score, and per-node execution trace.
+The agent state (`FinPulseGraphState`) is a strictly typed `TypedDict` carrying the request, sanitized query, active search query, rewrite counter, routed intent, retrieved citations, quantitative/options/risk outputs, synthesized report, hallucination & numerical faithfulness gate statuses, confidence score, and per-node execution trace.
 
 | Node | Responsibility | Inputs Read | State Keys Written |
 |---|---|---|---|
-| **`1. classify_and_route`** | Strips prompt-injection payloads (`sanitize_prompt_input`) and classifies the query into one of four execution intents: `quant_metrics`, `options_greeks`, `rag_knowledge`, or `hybrid_research`. | `request` | `sanitized_query`, `routed_intent`, `execution_trace` |
-| **`2. retrieve_context`** | Queries `HybridFAISSStore.search()` using Reciprocal Rank Fusion ($k=60$) over FAISS cosine similarity and BM25 lexical scores. | `sanitized_query`, `request.top_k` | `citations`, `execution_trace` |
-| **`3. execute_quant_tools`** | Invokes `LangChain Core` `@tool` functions (`compute_intraday_indicators_tool` and/or `compute_option_greeks_tool`) when the routed intent or request payload requires numerical computation; skips cleanly on pure knowledge queries. | `routed_intent`, `request.bars`, `request.option_params` | `quant_summary`, `option_greeks`, `execution_trace` |
-| **`4. synthesize_and_grade`** | Combines deterministic tool outputs with top retrieved corpus citations, runs the citation/hallucination gate (`hallucination_check_passed`), and computes a bounded confidence score (`0.55..0.99`). | `citations`, `quant_summary`, `option_greeks` | `answer`, `hallucination_check_passed`, `confidence_score`, `execution_trace` |
+| **`1. classify_and_route`** | Strips prompt-injection payloads (`sanitize_prompt_input`) and classifies the query into one of four execution intents: `quant_metrics`, `options_greeks`, `rag_knowledge`, or `hybrid_research`. | `request` | `sanitized_query`, `active_search_query`, `rewrite_count`, `routed_intent`, `execution_trace` |
+| **`2. retrieve_context`** | Queries `HybridFAISSStore.search()` using Reciprocal Rank Fusion ($k=60$) over FAISS cosine similarity and BM25 lexical scores. | `active_search_query`, `request.top_k` | `citations`, `execution_trace` |
+| **`2b. rewrite_query`** | Triggered via `add_conditional_edges` when initial retrieval similarity falls below `min_dense_confidence` (`rewrite_count < 1`). Expands financial acronyms/synonyms and loops back to `retrieve_context`. | `sanitized_query`, `rewrite_count` | `active_search_query`, `rewrite_count`, `execution_trace` |
+| **`3. execute_quant_tools`** | Conditionally routed for `quant_metrics`, `options_greeks`, and `hybrid_research` intents (bypassed via conditional edge on pure `rag_knowledge` queries). Invokes `compute_intraday_indicators_tool`, `compute_option_greeks_tool`, and `compute_position_risk_tool`. | `routed_intent`, `request.bars`, `request.option_params`, `request.risk_params` | `quant_summary`, `option_greeks`, `risk_summary`, `execution_trace` |
+| **`4. synthesize_and_grade`** | Combines deterministic tool outputs with top retrieved corpus citations, runs `verify_numerical_faithfulness` and the citation gate (`hallucination_check_passed`), and computes a bounded confidence score (`0.55..0.99`). | `citations`, `quant_summary`, `option_greeks`, `risk_summary` | `answer`, `hallucination_check_passed`, `numerical_faithfulness_passed`, `confidence_score`, `execution_trace` |
 
 ---
 
@@ -50,8 +55,8 @@ The agent state (`FinPulseGraphState`) is a strictly typed `TypedDict` carrying 
 - Splits documents along Markdown level-1/level-2 headers (`#` / `##`) first so conceptual sections stay intact.
 - If a section exceeds `chunk_size` (default `420` characters), slices it with a sliding window (`chunk_overlap = 60` characters) while preserving `doc_id`, `title`, `category`, and optional `ticker` metadata on every chunk (`<doc_id>#c<seq>`).
 
-### 4.2 Dense Feature Embeddings & `FAISS` Indexing (`encode_texts_dense`)
-- Produces 384-dimensional `float32` vectors normalized to unit $L_2$ length ($\|\mathbf{v}\|_2 = 1$).
+### 4.2 Hugging Face Dense Embeddings & `FAISS` Indexing (`encode_texts_dense`)
+- Uses **Hugging Face `SentenceTransformer("BAAI/bge-small-en-v1.5")`** (with `local_files_only=True` cache-first loading, thread-safe vector caching, and deterministic `encode_texts_hash` fallback for offline/air-gapped CI) to produce 384-dimensional `float32` vectors normalized to unit $L_2$ length ($\|\mathbf{v}\|_2 = 1$).
 - Because vectors are $L_2$-normalized, exact inner-product search in **`faiss.IndexFlatIP(384)`** is mathematically identical to cosine similarity:
   $$\cos(\mathbf{q}, \mathbf{d}) = \frac{\mathbf{q} \cdot \mathbf{d}}{\|\mathbf{q}\|_2 \|\mathbf{d}\|_2} = \mathbf{q} \cdot \mathbf{d}$$
 

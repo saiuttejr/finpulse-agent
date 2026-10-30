@@ -7,15 +7,19 @@ Interactive OpenAPI / Swagger UI: `http://localhost:8000/docs`
 
 ## Endpoint Summary
 
-| Method | Path | Auth Required | Description |
+| Method | Path | Auth / Scope Required | Description |
 |---|---|---|---|
 | `GET` | `/health` | No | Service health, version, indexed FAISS vector count, and embedding dimension |
-| `POST` | `/v1/auth/token` | Client credentials | Issue an `HS256` Bearer JWT access token |
-| `POST` | `/v1/rag/ingest` | `Bearer <JWT>` | Chunk, embed, and index new documents into the FAISS + BM25 store |
+| `GET` | `/metrics` | No | Operational telemetry: request counts, status codes, and p50/p95 latency (`ms`) |
+| `POST` | `/v1/auth/token` | Client credentials | Issue an `HS256` Bearer JWT access token with OAuth2 scopes |
+| `POST` | `/v1/rag/ingest` | `Bearer <JWT>` (`rag:write`) | Chunk, deduplicate (SHA-256), embed, and index documents into FAISS + BM25 |
 | `POST` | `/v1/rag/query` | No | Execute hybrid FAISS + BM25 Reciprocal Rank Fusion search |
+| `POST` | `/v1/rag/evaluate` | No | Run Golden IR Benchmark (`Recall@K`, `MRR@K`, `NDCG@K`) across 3 retrieval modes |
 | `POST` | `/v1/quant/indicators` | No | Compute vectorized Pandas/NumPy intraday indicators & touch probability |
-| `POST` | `/v1/quant/greeks` | No | Compute Black-Scholes option price, solved IV, and analytical Greeks |
-| `POST` | `/v1/agent/analyze` | `Bearer <JWT>` | Run the 4-node `LangGraph` agent across RAG + quantitative tools |
+| `POST` | `/v1/quant/greeks` | No | Compute Black-Scholes option price, solved IV, 1st/2nd-order Greeks & parity check |
+| `POST` | `/v1/quant/risk` | No | Compute ATR position sizing, Net-R after fees, Half-Kelly, 95% VaR/CVaR & governance |
+| `POST` | `/v1/agent/analyze` | `Bearer <JWT>` (`agent:run`) | Run the conditional `LangGraph` agent across RAG + quantitative tools |
+| `POST` | `/v1/agent/stream` | `Bearer <JWT>` (`agent:run`) | Stream live `LangGraph` node execution events via Server-Sent Events (`text/event-stream`) |
 
 ---
 
