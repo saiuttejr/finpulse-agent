@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finpulse-ai-agent"
+version = "0.1.0"
+description = "Enterprise Financial RAG & Quantitative Multi-Agent Service built with Python, FastAPI, LangChain, LangGraph, FAISS, Pandas, NumPy, OAuth2/JWT, and Streamlit."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Sai Uttej Rajoju", email = "saiuttej.r@gmail.com" }
+]
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+  "pydantic>=2.7.0",
+  "langchain-core>=0.3.0",
+  "langgraph>=0.2.0",
+  "faiss-cpu>=1.8.0",
+  "numpy>=1.26.0",
+  "pandas>=2.1.0",
+  "PyJWT>=2.8.0",
+  "httpx>=0.27.0",
+  "python-multipart>=0.0.9",
+  "streamlit>=1.38.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
